@@ -1,4 +1,4 @@
-This PoliceEMSActivity copy is patched to expose live on-duty counts for the TwoPoint loading screen.
+This PoliceEMSActivity copy is patched to expose live on-duty counts for the loading screen.
 
 Endpoint format:
   http://YOUR_SERVER_IP:30120/PoliceEMSActivity/policeemsactivity-duty.json
