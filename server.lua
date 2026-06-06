@@ -17,67 +17,331 @@ permTracker = {}
 activeBlip = {}
 onDuty = {}
 
--- Duty state helpers (added for integrations)
-local function _peaSetStateBag(src, key, value)
-    local p = Player(src)
-    if p then
-        pcall(function() p.state:set(key, value, true) end)
-    end
+local discordMemberCountCache = {
+	ok = false,
+	memberCount = nil,
+	onlineCount = nil,
+	source = 'not-loaded',
+	updatedAt = 0,
+	error = 'Discord total count has not loaded yet.'
+}
+
+local function trimString(value)
+	return tostring(value or ''):gsub('^%s+', ''):gsub('%s+$', '')
 end
 
-local function setDutyState(src, isOn)
-    if isOn then
-        onDuty[src] = true
-    else
-        onDuty[src] = nil
-    end
-
-    _peaSetStateBag(src, 'pea_onDuty', isOn and true or false)
-    _peaSetStateBag(src, 'pea_blipTag', activeBlip[src] or false)
-
-    TriggerEvent('PoliceEMSActivity:DutyChanged', src, isOn and true or false, activeBlip[src])
+local function getConfigString(name, defaultValue)
+	if Config ~= nil and Config[name] ~= nil then
+		return trimString(Config[name])
+	end
+	return trimString(defaultValue or '')
 end
 
--- Exports for other resources
-exports('IsOnDuty', function(src)
-    return onDuty[src] == true
-end)
+local function getConfigNumber(name, defaultValue)
+	if Config ~= nil and Config[name] ~= nil and tonumber(Config[name]) ~= nil then
+		return tonumber(Config[name])
+	end
+	return tonumber(defaultValue)
+end
 
-exports('GetDutyTag', function(src)
-    return activeBlip[src]
-end)
+local function parseDiscordInviteCode(value)
+	local invite = trimString(value)
+	if invite == '' then return '' end
+
+	invite = invite:gsub('https://discord%.gg/', '')
+	invite = invite:gsub('http://discord%.gg/', '')
+	invite = invite:gsub('https://discord%.com/invite/', '')
+	invite = invite:gsub('http://discord%.com/invite/', '')
+	invite = invite:gsub('discord%.gg/', '')
+	invite = invite:gsub('discord%.com/invite/', '')
+
+	local queryStart = invite:find('?', 1, true)
+	if queryStart ~= nil then
+		invite = invite:sub(1, queryStart - 1)
+	end
+
+	return trimString(invite)
+end
+
+local function updateDiscordMemberCountCache(ok, data)
+	data = data or {}
+	discordMemberCountCache = {
+		ok = ok == true,
+		memberCount = data.memberCount,
+		onlineCount = data.onlineCount,
+		source = data.source or 'unknown',
+		updatedAt = os.time(),
+		error = data.error
+	}
+
+	if ok == true then
+		print('[PoliceEMSActivity LoadingScreen] Discord member count updated: ' .. tostring(data.memberCount) .. ' via ' .. tostring(data.source or 'unknown'))
+	else
+		print('[PoliceEMSActivity LoadingScreen] Discord member count failed via ' .. tostring(data.source or 'unknown') .. ': ' .. tostring(data.error or 'unknown error'))
+	end
+end
+
+local function decodeDiscordJson(body)
+	if body == nil or body == '' then return nil end
+	local ok, decoded = pcall(json.decode, body)
+	if ok and type(decoded) == 'table' then
+		return decoded
+	end
+	return nil
+end
 
 
-local function broadcastDutyStats()
-	if SendLoadingScreenMessage == nil then
+local function requestDiscordCountFromGuildPreview(guildId, reason)
+	guildId = trimString(guildId)
+	if guildId == '' then
+		updateDiscordMemberCountCache(false, {
+			source = 'discord-guild-preview',
+			error = 'LOADING_SCREEN_DISCORD_GUILD_ID is blank.' .. (reason and (' ' .. reason) or '')
+		})
 		return
 	end
 
-	local deptCounts = {}
+	-- Public guild preview can return approximate counts for some discoverable/public guilds.
+	-- It is only a fallback; bot token or invite code is more reliable.
+	PerformHttpRequest('https://discord.com/api/v10/guilds/' .. guildId .. '/preview', function(statusCode, body)
+		local decoded = decodeDiscordJson(body)
+		if (tonumber(statusCode) or 0) >= 200 and (tonumber(statusCode) or 0) < 300 and decoded ~= nil and decoded.approximate_member_count ~= nil then
+			updateDiscordMemberCountCache(true, {
+				memberCount = tonumber(decoded.approximate_member_count),
+				onlineCount = tonumber(decoded.approximate_presence_count),
+				source = 'discord-guild-preview'
+			})
+		else
+			updateDiscordMemberCountCache(false, {
+				source = 'discord-guild-preview',
+				error = 'Discord guild preview failed. HTTP ' .. tostring(statusCode) .. '. Set LOADING_SCREEN_DISCORD_INVITE_CODE or discord_bot_token for a real total.' .. (reason and (' ' .. reason) or '')
+			})
+		end
+	end, 'GET', '', { ['Content-Type'] = 'application/json' })
+end
 
-	for src, isOn in pairs(onDuty) do
-		if isOn then
-			local tag = activeBlip[src]
-			if tag then
-				deptCounts[tag] = (deptCounts[tag] or 0) + 1
+local function requestDiscordCountFromConfiguredInviteOrWidget(reason)
+	local configuredInvite = parseDiscordInviteCode(getConfigString('LOADING_SCREEN_DISCORD_INVITE_CODE', ''))
+	if configuredInvite ~= '' then
+		PerformHttpRequest('https://discord.com/api/v10/invites/' .. configuredInvite .. '?with_counts=true', function(statusCode, body)
+			local decoded = decodeDiscordJson(body)
+			if (tonumber(statusCode) or 0) >= 200 and (tonumber(statusCode) or 0) < 300 and decoded ~= nil and decoded.approximate_member_count ~= nil then
+				updateDiscordMemberCountCache(true, {
+					memberCount = tonumber(decoded.approximate_member_count),
+					onlineCount = tonumber(decoded.approximate_presence_count),
+					source = 'discord-invite-count'
+				})
+			else
+				updateDiscordMemberCountCache(false, {
+					source = 'discord-invite-count',
+					error = 'Discord invite count failed. HTTP ' .. tostring(statusCode) .. (reason and ('; ' .. reason) or '')
+				})
+			end
+		end, 'GET', '', { ['Content-Type'] = 'application/json' })
+		return
+	end
+
+	local guildId = getConfigString('LOADING_SCREEN_DISCORD_GUILD_ID', '')
+	if guildId == '' then
+		updateDiscordMemberCountCache(false, {
+			source = 'discord-widget-invite',
+			error = 'LOADING_SCREEN_DISCORD_GUILD_ID is blank.'
+		})
+		return
+	end
+
+	PerformHttpRequest('https://discord.com/api/guilds/' .. guildId .. '/widget.json', function(statusCode, body)
+		local decoded = decodeDiscordJson(body)
+		local inviteCode = ''
+		if (tonumber(statusCode) or 0) >= 200 and (tonumber(statusCode) or 0) < 300 and decoded ~= nil and decoded.instant_invite ~= nil then
+			inviteCode = parseDiscordInviteCode(decoded.instant_invite)
+		end
+
+		if inviteCode == '' then
+			requestDiscordCountFromGuildPreview(guildId, 'Discord widget did not return an invite link.' .. (reason and (' ' .. reason) or ''))
+			return
+		end
+
+		PerformHttpRequest('https://discord.com/api/v10/invites/' .. inviteCode .. '?with_counts=true', function(inviteStatusCode, inviteBody)
+			local inviteDecoded = decodeDiscordJson(inviteBody)
+			if (tonumber(inviteStatusCode) or 0) >= 200 and (tonumber(inviteStatusCode) or 0) < 300 and inviteDecoded ~= nil and inviteDecoded.approximate_member_count ~= nil then
+				updateDiscordMemberCountCache(true, {
+					memberCount = tonumber(inviteDecoded.approximate_member_count),
+					onlineCount = tonumber(inviteDecoded.approximate_presence_count),
+					source = 'discord-widget-invite-count'
+				})
+			else
+				updateDiscordMemberCountCache(false, {
+					source = 'discord-widget-invite-count',
+					error = 'Discord widget invite count failed. HTTP ' .. tostring(inviteStatusCode) .. (reason and ('; ' .. reason) or '')
+				})
+			end
+		end, 'GET', '', { ['Content-Type'] = 'application/json' })
+	end, 'GET', '', { ['Content-Type'] = 'application/json' })
+end
+
+local function refreshDiscordMemberCount()
+	local overrideCount = getConfigNumber('LOADING_SCREEN_DISCORD_MEMBER_COUNT_OVERRIDE', nil)
+	if overrideCount ~= nil and overrideCount >= 0 then
+		updateDiscordMemberCountCache(true, {
+			memberCount = math.floor(overrideCount),
+			onlineCount = nil,
+			source = 'manual-override'
+		})
+		return
+	end
+
+	local guildId = getConfigString('LOADING_SCREEN_DISCORD_GUILD_ID', '')
+	local token = getConfigString('LOADING_SCREEN_DISCORD_BOT_TOKEN', '')
+	local tokenConvar = getConfigString('LOADING_SCREEN_DISCORD_BOT_TOKEN_CONVAR', 'discord_bot_token')
+
+	if token == '' and tokenConvar ~= '' then
+		token = trimString(GetConvar(tokenConvar, ''))
+	end
+
+	if guildId ~= '' and token ~= '' then
+		PerformHttpRequest('https://discord.com/api/v10/guilds/' .. guildId .. '?with_counts=true', function(statusCode, body)
+			local decoded = decodeDiscordJson(body)
+			local memberCount = nil
+			local onlineCount = nil
+
+			if decoded ~= nil then
+				memberCount = tonumber(decoded.member_count) or tonumber(decoded.approximate_member_count)
+				onlineCount = tonumber(decoded.approximate_presence_count)
+			end
+
+			if (tonumber(statusCode) or 0) >= 200 and (tonumber(statusCode) or 0) < 300 and memberCount ~= nil then
+				updateDiscordMemberCountCache(true, {
+					memberCount = memberCount,
+					onlineCount = onlineCount,
+					source = 'discord-bot-guild-count'
+				})
+			else
+				requestDiscordCountFromConfiguredInviteOrWidget('Bot guild count failed. HTTP ' .. tostring(statusCode) .. '.')
+			end
+		end, 'GET', '', {
+			['Authorization'] = 'Bot ' .. token,
+			['Content-Type'] = 'application/json'
+		})
+		return
+	end
+
+	requestDiscordCountFromConfiguredInviteOrWidget(nil)
+end
+
+local function getDiscordMemberCountPayload()
+	return {
+		type = 'discordMemberCount',
+		source = discordMemberCountCache.source,
+		ok = discordMemberCountCache.ok,
+		memberCount = discordMemberCountCache.memberCount,
+		member_count = discordMemberCountCache.memberCount,
+		approximate_member_count = discordMemberCountCache.memberCount,
+		onlineCount = discordMemberCountCache.onlineCount,
+		updatedAt = discordMemberCountCache.updatedAt,
+		error = discordMemberCountCache.error
+	}
+end
+
+Citizen.CreateThread(function()
+	Wait(2500)
+	while true do
+		refreshDiscordMemberCount()
+		local refreshSeconds = getConfigNumber('LOADING_SCREEN_DISCORD_REFRESH_SECONDS', 300)
+		if refreshSeconds == nil or refreshSeconds < 60 then refreshSeconds = 300 end
+		Wait(math.floor(refreshSeconds * 1000))
+	end
+end)
+
+local function buildPoliceEMSActivityDutyStats()
+	-- This is the only source of truth for the loading screen on-duty box.
+	-- It uses PoliceEMSActivity's own onDuty table and activeBlip selections.
+	local departmentsByLabel = {}
+	local departmentsArray = {}
+
+	for label, _ in pairs(roleList) do
+		departmentsByLabel[label] = {
+			label = label,
+			count = 0,
+			names = {}
+		}
+	end
+
+	for src, _ in pairs(onDuty) do
+		local tag = activeBlip[src]
+		if tag ~= nil and departmentsByLabel[tag] ~= nil then
+			local dept = departmentsByLabel[tag]
+			dept.count = dept.count + 1
+			local playerName = GetPlayerName(tonumber(src))
+			if playerName ~= nil then
+				table.insert(dept.names, playerName)
 			end
 		end
 	end
 
-	local departmentsArray = {}
-
-	for label, count in pairs(deptCounts) do
-		table.insert(departmentsArray, { label = label, count = count })
+	for label, dept in pairs(departmentsByLabel) do
+		if dept.count > 0 then
+			table.insert(departmentsArray, dept)
+		end
 	end
 
-	local payload = {
-		type = "dutyStats",
+	return {
+		type = 'dutyStats',
+		source = 'PoliceEMSActivity',
+		updatedAt = os.time(),
 		departments = departmentsArray
 	}
-
-	SendLoadingScreenMessage(json.encode(payload))
 end
 
+local function broadcastDutyStats()
+	-- Kept as a lightweight optional path for loading screens that support messages.
+	-- The main display path is the PoliceEMSActivity HTTP endpoint below.
+	if SendLoadingScreenMessage == nil then
+		return
+	end
+
+	SendLoadingScreenMessage(json.encode(buildPoliceEMSActivityDutyStats()))
+end
+
+local function sendJsonResponse(res, status, body)
+	res.writeHead(status, {
+		['Content-Type'] = 'application/json',
+		['Access-Control-Allow-Origin'] = '*',
+		['Access-Control-Allow-Methods'] = 'GET, OPTIONS',
+		['Access-Control-Allow-Headers'] = 'Content-Type',
+		['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+	})
+	res.send(json.encode(body))
+end
+
+SetHttpHandler(function(req, res)
+	if req.method == 'OPTIONS' then
+		return sendJsonResponse(res, 200, { ok = true })
+	end
+
+	local path = req.path or ''
+
+	if path == '/discord-member-count.json'
+		or path == '/discord-count.json'
+		or path == '/PoliceEMSActivity/discord-member-count.json'
+		or path == '/PoliceEMSActivity/discord-count.json'
+		or string.find(path, 'discord%-member%-count%.json') ~= nil
+		or string.find(path, 'discord%-count%.json') ~= nil then
+		if discordMemberCountCache.ok ~= true and (os.time() - (discordMemberCountCache.updatedAt or 0)) > 30 then
+			refreshDiscordMemberCount()
+		end
+		return sendJsonResponse(res, discordMemberCountCache.ok and 200 or 503, getDiscordMemberCountPayload())
+	end
+
+	if path == '/policeemsactivity-duty.json'
+		or path == '/PoliceEMSActivity/duty.json'
+		or path == '/PoliceEMSActivity/policeemsactivity-duty.json'
+		or path == '/duty.json' then
+		return sendJsonResponse(res, 200, buildPoliceEMSActivityDutyStats())
+	end
+
+	return sendJsonResponse(res, 404, { error = 'Not found' })
+end)
 
 prefix = '^9[^5Badger-Blips^9] ^3';
 
@@ -132,11 +396,10 @@ AddEventHandler("playerDropped", function()
 		end 
 	end
 	timeTracker[source] = nil;
-	setDutyState(source, false);
+	onDuty[source] = nil;
 	broadcastDutyStats();
 	permTracker[source] = nil;
 	hasPerms[source] = nil;
-	_peaSetStateBag(source, 'pea_blipTag', false)
 	activeBlip[source] = nil;
 	-- Remove them from Blips:
 	TriggerEvent('eblips:remove', source)
@@ -172,12 +435,12 @@ RegisterCommand('bduty', function(source, args, rawCommand)
 			end
 			TriggerEvent('eblips:add', {name = tag .. GetPlayerName(source), src = source, color = colorr}); 
 			sendMsg(source, 'You have toggled your emergency blip ^2ON ^3and your Blip-Tag is: ' .. tag)
-			setDutyState(source, true);
+			onDuty[source] = true;
 			broadcastDutyStats();
 			timeTracker[source] = 0;
 			TriggerClientEvent('PoliceEMSActivity:GiveWeapons', source);
 		else 
-			setDutyState(source, false);
+			onDuty[source] = nil;
 			broadcastDutyStats();
 			local tag = activeBlip[source];
 			local webHook = roleList[activeBlip[source]][3];
@@ -246,7 +509,6 @@ RegisterCommand('bliptag', function(source, args, rawCommand)
 						timeTracker[source] = 0;
 					end
 					activeBlip[source] = permTracker[source][sel];
-				_peaSetStateBag(source, 'pea_blipTag', activeBlip[source] or false)
 					sendMsg(source, 'You have set your Blip-Tag to ^1' .. permTracker[source][sel]);
 					if onDuty[source] ~= nil then 
 						tag = activeBlip[source];
@@ -290,8 +552,6 @@ AddEventHandler('PoliceEMSActivity:RegisterUser', function()
 					if exports.Badger_Discord_API:CheckEqual(v[1], roleIDs[j]) then
 						table.insert(perms, k);
 						activeBlip[src] = k;
-					_peaSetStateBag(src, 'pea_blipTag', activeBlip[src] or false)
-					_peaSetStateBag(src, 'pea_onDuty', false)
 						hasPerms[src] = true;
 						print("[PEA] Gave Perms Sucessfully")
 					end
@@ -305,4 +565,5 @@ AddEventHandler('PoliceEMSActivity:RegisterUser', function()
 		print("[PoliceEMSActivity] " .. GetPlayerName(src) .. " has not gotten their permissions cause discord was not detected...")
 	end
 	permTracker[src] = perms; 
+	broadcastDutyStats();
 end)
