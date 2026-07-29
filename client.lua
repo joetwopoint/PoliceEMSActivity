@@ -1,7 +1,4 @@
-AddEventHandler('playerSpawned', function() 
-	-- The player has spawned, we gotta set their perms up
-	TriggerServerEvent('PoliceEMSActivity:RegisterUser'); 
-end)
+-- Discord permissions are loaded lazily by manual commands.
 function giveWeapon(hash)
     GiveWeaponToPed(GetPlayerPed(-1), GetHashKey(hash), 999, false, false)
 end
